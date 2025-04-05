@@ -1,231 +1,229 @@
+# udpfrag - UDP Fragmentation and Reassembly Core for Go
 
-# udpfrag - UDP Fragmentation and Reassembly Package for Go
+[![Go Reference](https://pkg.go.dev/badge/github.com/cjbrigato/udpfrag.svg)](https://pkg.go.dev/github.com/cjbrigato/udpfrag)
+[![Go Report Card](https://goreportcard.com/badge/github.com/cjbrigato/udpfrag)](https://goreportcard.com/report/github.com/cjbrigato/udpfrag)
 
-[![GoDoc](https://godoc.org/github.com/cjbrigato/udpfrag?status.svg)](https://godoc.org/github.com/cjbrigato/udpfrag)
 
-**udpfrag** is a Go package providing application-level UDP fragmentation and reassembly. It allows you to send UDP messages larger than the network MTU by automatically splitting them into fragments on the sender side and reassembling them back into the original message on the receiver side.
+`udpfrag` is a Go package providing the core logic to overcome the typical size limitations of UDP datagrams (imposed by MTU - Maximum Transmission Unit). It automatically fragments large messages before sending and reassembles them upon reception.
 
-This package is designed to be production-ready, offering configurability, logging, and error handling for robust UDP communication in Go applications.
+This package provides:
 
-## Features
+1.  The low-level `FragmentData` and `ReassembleData` functions.
+2.  A convenient `UDPClientConn` type (`net.Conn`-like) for *client-side* connections that handles fragmentation/reassembly transparently.
 
-*   **Automatic Fragmentation:**  Splits large messages into UDP fragments smaller than the configured `MaxFragmentSize` before sending.
-*   **Reliable Reassembly:** Reassembles incoming UDP fragments back into the original message based on message IDs and fragment numbers.
-*   **Configurable Parameters:**
-    *   `MaxFragmentSize`:  Adjust the maximum payload size of UDP fragments.
-    *   `ReassemblyTimeout`:  Set the timeout duration for reassembly, discarding incomplete messages after timeout.
-    *   `CleanupInterval`:  Configure the interval for periodic cleanup of timed-out reassembly buffers.
-    *   Customizable Logger: Use your own `log.Logger` instance for package logging.
-*   **Efficient Buffer Management:** Utilizes buffer pooling to minimize memory allocations and improve performance.
-*   **Error Handling:** Provides a custom `ReassemblyError` type for specific reassembly-related issues.
-*   **Production Ready:** Designed for integration into real-world applications with focus on robustness and configurability.
+For a high-level *server-side* abstraction that mimics `net.Listener`, please see the companion package: [**`github.com/cjbrigato/udplistener`**](https://github.com/cjbrigato/udplistener). The `udplistener` package uses `udpfrag` internally.
+
+## Features (udpfrag core)
+
+*   **Core Fragmentation Logic:** Splits messages larger than the configured `MaxFragmentSize`.
+*   **Core Reassembly Logic:** Reconstructs the original message from received fragments.
+*   **`UDPClientConn`:** A `net.Conn`-like interface for **client** connections.
+*   **Configurable:** Allows setting maximum fragment payload size, reassembly timeout, and cleanup interval (configuration applies globally and is used by `udplistener` as well).
+*   **Resource Pooling:** Uses `sync.Pool` to reuse buffers, reducing GC pressure.
+*   **Timeout Handling:** Automatically cleans up incomplete message buffers after a timeout.
+*   **Conditional Logging:** Includes optional debug logging.
 
 ## Installation
 
-To install the `udpfrag` package, use `go get`:
-
 ```bash
-go get github.com/cjbrigato/udpfrag  
-```
+# To get the core fragmentation logic and client helper
+go get github.com/cjbrigato/udpfrag
 
-Then you can import it in your Go code:
-
-```go
-import "github.com/cjbrigato/udpfrag"
+# To get the server listener helper (which includes udpfrag)
+go get github.com/cjbrigato/udplistener
 ```
 
 ## Usage
 
-### Configuration
+### Configuration (Applies to both `udpfrag` and `udplistener`)
 
-You can configure the `udpfrag` package using the `udpfrag.Config` struct and the `udpfrag.Configure()` function.  If you don't configure it, default values will be used.
+Before using either the client or server helpers, you can configure the fragmentation parameters globally.
 
 ```go
 package main
 
 import (
-	"log"
 	"time"
 	"github.com/cjbrigato/udpfrag"
 )
 
 func main() {
-	config := udpfrag.Config{
-		MaxFragmentSize:  1300,                      // Example: Custom MaxFragmentSize
-		ReassemblyTimeout: 10 * time.Second,          // Example: Custom reassembly timeout
-		CleanupInterval:   30 * time.Second,         // Example: Custom cleanup interval
-		Logger:           log.New(log.Writer(), "myapp: ", log.LstdFlags), // Example: Custom logger
-	}
-	udpfrag.Configure(config)
+    myConfig := udpfrag.Config{
+        MaxFragmentSize:   1024,                // Max bytes of *payload* per fragment
+        ReassemblyTimeout: 10 * time.Second,    // How long to wait for missing fragments
+        CleanupInterval:   30 * time.Second,    // How often to check for timed-out buffers
+    }
+    debugEnabled := false // Enable verbose logging?
 
-    // ... rest of your application code ...
+    udpfrag.Configure(myConfig, debugEnabled)
+
+    // Now use DialUDPFrag or udplistener.NewUDPListener...
 }
+
 ```
 
-**Configuration Options:**
+*   **`MaxFragmentSize`**: Max payload bytes per fragment. Header (10 bytes) is added. Defaults to `1400 - 10`.
+*   **`ReassemblyTimeout`**: Timeout for incomplete messages. Defaults to 5s.
+*   **`CleanupInterval`**: How often to clean up timed-out buffers. Defaults to 10s.
+*   **`debugLog` (bool)**: Enables/disables verbose logging globally. Defaults to `false`.
 
-*   **`MaxFragmentSize int`**:  The maximum size (in bytes) of the data payload within a UDP fragment, excluding the `FragmentHeader`.  Defaults to `1400 - FragmentHeaderSize`.  Should be less than the network MTU minus UDP and IP header sizes.
-*   **`ReassemblyTimeout time.Duration`**: The duration after which the reassembly process for a message is considered failed and the partially received fragments are discarded. Defaults to `5 * time.Second`.
-*   **`CleanupInterval time.Duration`**: The interval at which the package periodically checks for and cleans up timed-out reassembly buffers. Defaults to `10 * time.Second`.
-*   **`Logger *log.Logger`**:  A custom `log.Logger` instance to use for logging within the `udpfrag` package. If `nil`, a default logger will be used.
+### Client Side (`udpfrag.UDPClientConn`)
 
-### Server-Side Usage (Receiving and Reassembling)
-
-On the server side, you need to use `udpfrag.HandleUDPConn()` to listen for UDP packets, reassemble fragmented messages, and process the reassembled messages using a message handler function.
+Use `DialUDPFrag` for client connections to a specific server address.
 
 ```go
 package main
 
 import (
+	"fmt"
 	"log"
-	"net"
-	"os"
-	"os/signal"
-	"syscall"
-	"github.com/cjbrigato/udpfrag" // 
+	"time"
+
+	"github.com/cjbrigato/udpfrag" // Use the client helper from this package
 )
 
 func main() {
-	udpAddr, err := net.ResolveUDPAddr("udp", ":20001")
+	// Optional: Configure udpfrag first (see above)
+	udpfrag.Configure(udpfrag.Config{}, false) // Use defaults, disable debug logs
+
+	// Dial the remote UDP server
+	conn, err := udpfrag.DialUDPFrag("udp", "127.0.0.1:8080", nil) // nil logger uses default
 	if err != nil {
-		log.Fatalf("Error resolving UDP address: %v", err)
-	}
-	conn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		log.Fatalf("Error listening on UDP: %v", err)
+		log.Fatalf("Failed to dial: %v", err)
 	}
 	defer conn.Close()
 
-	log.Println("UDP server listening on", udpAddr)
+	log.Printf("Connected from %s to %s", conn.LocalAddr(), conn.RemoteAddr())
 
-	// Set up signal handling for clean shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	message := []byte("This is a potentially large message that might be fragmented.")
+	// Add more data to message to ensure fragmentation if needed...
 
-	// Message handler function (replace with your application logic)
-	messageHandler := func(addr *net.UDPAddr, message []byte) error {
-		log.Printf("Received reassembled message from %s: %d bytes", addr.String(), len(message))
-		// Process your message here...
-		return nil
+	// Write - fragmentation happens automatically
+	_, err = conn.Write(message)
+	if err != nil {
+		log.Fatalf("Failed to write: %v", err)
 	}
+	log.Printf("Wrote message.")
 
-	// Start handling UDP connections in a goroutine
-	go func() {
-		udpfrag.HandleUDPConn(conn, messageHandler)
-	}()
-
-	// Wait for a shutdown signal
-	<-sigChan
-	log.Println("Shutting down server...")
-	// Perform any cleanup here if needed before exiting
-	log.Println("Server shutdown complete.")
+	// Read - reassembly happens automatically
+	readBuffer := make([]byte, udpfrag.DefaultMaxFragmentSize*2) // Adjust buffer size
+	n, err := conn.Read(readBuffer)
+	if err != nil {
+		log.Fatalf("Failed to read: %v", err)
+	}
+	log.Printf("Read %d bytes: %s\n", n, string(readBuffer[:n]))
 }
 ```
 
-**Important:**  Replace the example `messageHandler` with your actual message processing logic.
+### Server Side (`udplistener`)
 
-### Client-Side Usage (Fragmentation and Sending)
-
-On the client side, use `udpfrag.FragmentData()` to fragment your data before sending it over UDP.
+Use the separate `udplistener` package for a `net.Listener`-like experience. It handles multiple clients and reassembly automatically using `udpfrag`.
 
 ```go
 package main
 
 import (
+	"io"
 	"log"
 	"net"
 	"time"
-	"bytes"
-	"encoding/binary"
-	"hash/crc32"
-	"github.com/cjbrigato/udpfrag" // Replace with your module path
+
+	"github.com/cjbrigato/udpfrag"     // For configuration
+	"github.com/cjbrigato/udplistener" // Use the listener helper package
 )
 
-func main() {
-	serverAddr, err := net.ResolveUDPAddr("udp", "localhost:20001")
-	if err != nil {
-		log.Fatalf("Error resolving server address: %v", err)
-	}
-	conn, err := net.DialUDP("udp", nil, serverAddr)
-	if err != nil {
-		log.Fatalf("Error dialing UDP: %v", err)
-	}
-	defer conn.Close()
+// handleConnection processes a single "virtual" connection from a client.
+func handleConnection(conn net.Conn) {
+	remoteAddr := conn.RemoteAddr()
+	log.Printf("Handling connection from %s", remoteAddr)
+	defer log.Printf("Closing connection from %s", remoteAddr)
+	defer conn.Close() // Crucial to clean up listener state
 
-	messagePayload := generateLargeMessage(2000) // Example: Generate a large message (replace with your data)
-	checksum := crc32.ChecksumIEEE(messagePayload)
+	// Example: Echo server
+	buffer := make([]byte, 8192) // Buffer for reassembled messages
+	for {
+		// Set a read deadline for this specific client connection
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second)) // e.g., 60s idle timeout
 
-	fullMessage := new(bytes.Buffer)
-	binary.Write(fullMessage, binary.BigEndian, checksum) // Prepend checksum
-	fullMessage.Write(messagePayload)
-
-	fragments, err := udpfrag.FragmentData(fullMessage.Bytes())
-	if err != nil {
-		log.Fatalf("Error fragmenting data: %v", err)
-	}
-
-	log.Println("Sending fragmented message...")
-	for _, fragment := range fragments {
-		_, err := conn.Write(fragment)
+		n, err := conn.Read(buffer)
 		if err != nil {
-			log.Println("Error sending fragment:", err)
+			if err != io.EOF && err != net.ErrClosed { // Don't log expected closure errors as harshly
+                // Check for timeout error specifically
+                if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+                    log.Printf("Client %s timed out.", remoteAddr)
+                } else {
+				    log.Printf("Error reading from %s: %v", remoteAddr, err)
+                }
+			}
+			break // Exit loop on error (including EOF/timeout/closed)
 		}
-		time.Sleep(10 * time.Millisecond) // Simulate network rate limiting
+
+		log.Printf("Received %d bytes from %s: %s", n, remoteAddr, string(buffer[:n]))
+
+		// Write response back - fragmentation happens automatically if needed
+		// Set a write deadline
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		_, err = conn.Write(buffer[:n]) // Echo back
+		if err != nil {
+			log.Printf("Error writing to %s: %v", remoteAddr, err)
+			break // Exit loop on write error
+		}
 	}
-	log.Println("Fragmented message sent.")
 }
 
+func main() {
+	// Optional: Configure udpfrag first (applies globally)
+	udpfrag.Configure(udpfrag.Config{ReassemblyTimeout: 15*time.Second}, true) // Custom timeout, enable debug logs
 
-func generateLargeMessage(size int) []byte { // Example utility function
-	data := make([]byte, size)
-	// ... (fill data with content as needed) ...
-	return data
-}
-```
+	// Create the UDP Listener using the udplistener package
+	listener, err := udplistener.NewUDPListener(":8080", nil) // nil logger uses default
+	if err != nil {
+		log.Fatalf("Failed to create UDP listener: %v", err)
+	}
+	defer listener.Close() // Ensure listener stops cleanly
 
-### Example Message Handler
+	log.Printf("UDP server listening on %s", listener.Addr())
 
-The `udpfrag.HandleUDPConn()` function requires a message handler function with the following signature:
+	// Accept loop
+	for {
+		// Accept waits for the *first fully reassembled message* from a new client
+		// and returns a net.Conn representing that client connection.
+		conn, err := listener.Accept()
+		if err != nil {
+			// Check if the error is due to the listener being closed.
+			if err == net.ErrClosed {
+				log.Println("Listener closed, exiting accept loop.")
+				break // Exit loop cleanly
+			}
+			log.Printf("Error accepting connection: %v", err)
+			continue // Keep listening
+		}
 
-```go
-type MessageHandler func(addr *net.UDPAddr, message []byte) error
-```
-
-This function is called by `HandleUDPConn` whenever a complete message is reassembled.  You are responsible for implementing your application-specific logic within this handler, such as:
-
-*   Decoding the message payload.
-*   Verifying message integrity (e.g., checksum verification like in `udpfrag.ExampleMessageHandler`).
-*   Processing the received data.
-*   Potentially sending a response.
-
-The handler function should return `nil` if the message was processed successfully, or an `error` if an error occurred during processing. Errors returned by the message handler will be logged by `udpfrag.HandleUDPConn`.
-
-## Error Handling
-
-The `udpfrag` package defines a custom error type `udpfrag.ReassemblyError`. This error type is returned by `udpfrag.ReassembleData()` and `udpfrag.assembleMessage()` in cases of reassembly failures, such as timeouts or invalid message IDs. You can check for this error type to handle reassembly-specific errors in your application.
-
-```go
-reassembledData, err := udpfrag.ReassembleData(packet)
-if err != nil {
-    if errors.As(err, &udpfrag.ReassemblyError{}) {
-        log.Printf("Reassembly error: %v", err)
-        // Handle reassembly error specifically (e.g., request retransmission, discard message)
-    } else if err != nil {
-        log.Printf("Other error during reassembly: %v", err)
-        // Handle other errors
-    }
+		// Handle each connection concurrently
+		go handleConnection(conn)
+	}
 }
 ```
 
-## Performance Considerations
+## Logging
 
-The `udpfrag` package is designed with performance in mind and includes optimizations like:
+Both `udpfrag` and `udplistener` use `udpfrag`'s conditional logger (`CondLogger`). Debug logging (globally enabled/disabled via `udpfrag.Configure`) prints detailed information about fragmentation, reassembly, timeouts, and connection states to `os.Stderr` by default.
 
-*   **Buffer Pooling:**  Reuses buffers for UDP reads and fragment headers to reduce memory allocations and garbage collection overhead.
-*   **Efficient Assembly:**  Assembles messages directly into pre-allocated byte slices to minimize data copying.
+You can provide your own `*udpfrag.CondLogger` instance to `udpfrag.DialUDPFrag` or `udplistener.NewUDPListener` if you need more control over log output (e.g., directing logs to a file or integrating with a different logging framework).
 
-For optimal performance in high-throughput scenarios, consider profiling your application with Go's `pprof` tool to identify any potential bottlenecks and fine-tune configurations like `MaxFragmentSize` and buffer sizes as needed.
+## Important Considerations
+
+*   **UDP is Unreliable:** These packages solve message *size* limitations but **do not** add reliability (guaranteed delivery, strict ordering between messages). UDP packets (and thus entire reassembled messages) can still be lost, duplicated, or arrive out of order relative to other messages. Implement application-level checks (sequence numbers, ACKs, retries) if needed, or use TCP.
+*   **No Built-in Integrity Checks:** No checksums beyond the standard UDP checksum are added. Add your own payload integrity checks (e.g., CRC32, hash) before sending and verify after receiving if data corruption is a concern.
+*   **Resource Usage:** Reassembling messages requires temporary memory buffers. The `udplistener` manages connections per remote client. Configure `ReassemblyTimeout` appropriately via `udpfrag.Configure` to prevent stale state buildup. Ensure `conn.Close()` is called in server handlers to release resources associated with a client in the `udplistener`.
+*   **Connection Model:**
+    *   `udpfrag.UDPClientConn`: Represents a connection *to* a single remote server (uses `net.DialUDP`).
+    *   `udplistener`: Listens for incoming packets and creates a virtual `net.Conn` (`UDPpseudoConn`) *per unique remote client address* once the first complete message is received from that client.
+
+## Contributing
+
+Contributions (bug reports, feature requests, pull requests) to `udpfrag` or `udplistener` are welcome! Please open an issue to discuss significant changes.
 
 ## License
 
-This package is licensed under the [MIT License](LICENSE).
+Distributed under the MIT license. See `LICENSE` file for details.
